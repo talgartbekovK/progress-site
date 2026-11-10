@@ -23,6 +23,28 @@ python server.py serve
 
 Если пароль нужно заменить, выполните `python server.py set-password --login ЛОГИН`. Старые сеансы пользователя будут завершены.
 
+## PythonAnywhere (бесплатный предпросмотр с базой)
+
+Создайте веб-приложение через **Web → Add a new web app → Manual configuration**. В Bash-консоли клонируйте репозиторий:
+
+```bash
+git clone https://github.com/talgartbekovK/progress-site.git ~/progress-site
+```
+
+В WSGI-файле, указанном на странице Web, оставьте:
+
+```python
+import sys
+path = '/home/YOUR_USERNAME/progress-site'
+if path not in sys.path:
+    sys.path.insert(0, path)
+from wsgi import application
+```
+
+Замените `YOUR_USERNAME` на логин PythonAnywhere. В Bash-консоли выполните `cd ~/progress-site && python3 server.py create-admin --login owner`; введите новый пароль без отображения на экране. Затем нажмите **Reload** на странице Web и откройте `https://YOUR_USERNAME.pythonanywhere.com/admin.html`.
+
+При следующих изменениях кода выполните `git pull` в папке проекта на PythonAnywhere и снова нажмите **Reload**. SQLite-файл в `data/` хранится отдельно от Git. Для бесплатного аккаунта необходимо вовремя продлевать веб-приложение в панели PythonAnywhere.
+
 ## Проверка
 
 ```powershell
