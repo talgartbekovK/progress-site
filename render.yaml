@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: progress-site
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py serve --host 0.0.0.0
+    healthCheckPath: /api/videos
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: PROGRESS_INITIAL_ADMIN_PASSWORD
+        sync: false

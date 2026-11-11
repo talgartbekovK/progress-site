@@ -20,13 +20,44 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
+
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('PROGRESS_DB', ROOT / 'data' / 'progress.sqlite3'))
+DATABASE_URL = os.environ.get('DATABASE_URL')
 SESSION_AGE = 60 * 60 * 24 * 7
 LOGIN_FAILURES: dict[str, list[float]] = {}
 
 
+class PostgresConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, query, params=()):
+        return self.connection.execute(query.replace('?', '%s'), params)
+
+    def executescript(self, script):
+        for statement in script.split(';'):
+            if statement.strip():
+                self.execute(statement)
+
+    def commit(self): self.connection.commit()
+    def rollback(self): self.connection.rollback()
+    def close(self): self.connection.close()
+
+
 def connect():
+    if os.environ.get('RENDER') == 'true' and not DATABASE_URL:
+        raise RuntimeError('На Render требуется DATABASE_URL: локальная SQLite не сохраняется')
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError('Для PostgreSQL установите зависимости из requirements.txt')
+        return PostgresConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10))
     DB.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB, timeout=10)
     db.row_factory = sqlite3.Row
@@ -50,7 +81,7 @@ def db_session():
 
 def init_db():
     with db_session() as db:
-        db.executescript('''
+        schema = '''
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL, login TEXT NOT NULL UNIQUE,
           phone TEXT, role TEXT NOT NULL CHECK(role IN ('admin','teacher','parent')),
@@ -98,7 +129,31 @@ def init_db():
           published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1)),
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        ''')
+        '''
+        if DATABASE_URL:
+            schema = schema.replace('id INTEGER PRIMARY KEY', 'id SERIAL PRIMARY KEY')
+        db.executescript(schema)
+        initial_password = os.environ.get('PROGRESS_INITIAL_ADMIN_PASSWORD')
+        if initial_password:
+            if len(initial_password) < 10:
+                raise ValueError('Начальный пароль администратора должен содержать не менее 10 символов')
+            owner = db.execute("SELECT * FROM users WHERE login='owner' AND role='admin'").fetchone()
+            if owner:
+                if not verify_password(initial_password, owner['password_hash']):
+                    db.execute('UPDATE users SET password_hash=? WHERE id=?',
+                               (password_hash(initial_password), owner['id']))
+                    db.execute('DELETE FROM sessions WHERE user_id=?', (owner['id'],))
+            elif not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
+                db.execute('INSERT INTO users(name,login,role,password_hash) VALUES(?,?,?,?)',
+                           ('Администратор', 'owner', 'admin', password_hash(initial_password)))
+        if os.environ.get('RENDER') == 'true' and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
+            raise RuntimeError('На Render нужен PROGRESS_INITIAL_ADMIN_PASSWORD для первого администратора')
+
+
+def insert_id(db, query, params):
+    if DATABASE_URL:
+        return db.execute(query + ' RETURNING id', params).fetchone()['id']
+    return db.execute(query, params).lastrowid
 
 
 def password_hash(password: str) -> str:
@@ -243,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
                     status, payload, cookie = result
                     self.respond(status, payload, cookie)
         except APIError as exc: self.respond(exc.status, {'error': exc.message})
-        except sqlite3.IntegrityError as exc:
+        except (sqlite3.IntegrityError, psycopg.IntegrityError if psycopg else sqlite3.IntegrityError):
             self.respond(409, {'error': 'Запись уже существует или указана неверная связь'})
         except Exception as exc:
             self.log_error('Unexpected server error: %s', exc)
@@ -368,10 +423,10 @@ class Handler(BaseHTTPRequestHandler):
             name, login = required_text(data, 'name'), required_text(data, 'login', 80).lower()
             password = required_text(data, 'password', 200)
             if len(password) < 10: raise APIError(400, 'Пароль должен содержать не менее 10 символов')
-            cur = db.execute('INSERT INTO users(name,login,role,password_hash) VALUES(?,?,?,?)',
-                             (name, login, 'teacher', password_hash(password)))
+            teacher_id = insert_id(db, 'INSERT INTO users(name,login,role,password_hash) VALUES(?,?,?,?)',
+                                   (name, login, 'teacher', password_hash(password)))
             db.commit()
-            return 201, {'id': cur.lastrowid}, None
+            return 201, {'id': teacher_id}, None
         if method == 'POST' and path == '/api/admin/students':
             data = self.data()
             teacher_id = positive_id(data['teacher_id']) if data.get('teacher_id') else None
@@ -380,12 +435,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise APIError(400, 'Преподаватель не найден')
             if parent_id and not db.execute("SELECT 1 FROM users WHERE id=? AND role='parent' AND active=1", (parent_id,)).fetchone():
                 raise APIError(400, 'Родитель не найден')
-            cur = db.execute('''INSERT INTO students(name,teacher_id,parent_id,course,type,schedule,cost,payment)
+            student_id = insert_id(db, '''INSERT INTO students(name,teacher_id,parent_id,course,type,schedule,cost,payment)
                 VALUES(?,?,?,?,?,?,?,?)''', (required_text(data, 'name'), teacher_id, parent_id,
                 optional_text(data, 'course'), optional_text(data, 'type'), optional_text(data, 'schedule'),
                 optional_text(data, 'cost'), optional_text(data, 'payment')))
             db.commit()
-            return 201, {'id': cur.lastrowid}, None
+            return 201, {'id': student_id}, None
         if method == 'PATCH' and path.startswith('/api/admin/students/'):
             student_id = positive_id(path.rsplit('/', 1)[-1]); data = self.data()
             if set(data) == {'active'}:
@@ -406,11 +461,11 @@ class Handler(BaseHTTPRequestHandler):
         if method == 'POST' and path == '/api/admin/tests':
             data = self.data()
             clean, duration = self.validate_test(data)
-            cur = db.execute('''INSERT INTO tests(title,subject,questions_json,duration_minutes,published,is_paid)
+            test_id = insert_id(db, '''INSERT INTO tests(title,subject,questions_json,duration_minutes,published,is_paid)
                 VALUES(?,?,?,?,?,?)''', (required_text(data, 'title'), required_text(data, 'subject'),
                 json.dumps(clean, ensure_ascii=False), duration, boolean(data, 'published'), boolean(data, 'is_paid')))
             db.commit()
-            return 201, {'id': cur.lastrowid}, None
+            return 201, {'id': test_id}, None
         if method == 'PATCH' and path.startswith('/api/admin/tests/'):
             test_id = positive_id(path.rsplit('/', 1)[-1]); data = self.data()
             if set(data) == {'published'}:
@@ -426,9 +481,9 @@ class Handler(BaseHTTPRequestHandler):
             data = self.data(); url = required_text(data, 'url', 1000)
             parsed = urlparse(url)
             if parsed.scheme != 'https' or not parsed.netloc: raise APIError(400, 'Нужна HTTPS-ссылка на видео')
-            cur = db.execute('INSERT INTO videos(title,subject,url,published) VALUES(?,?,?,?)',
+            video_id = insert_id(db, 'INSERT INTO videos(title,subject,url,published) VALUES(?,?,?,?)',
                              (required_text(data, 'title'), required_text(data, 'subject'), url, boolean(data, 'published')))
-            db.commit(); return 201, {'id': cur.lastrowid}, None
+            db.commit(); return 201, {'id': video_id}, None
         if method == 'PATCH' and path.startswith('/api/admin/videos/'):
             video_id = positive_id(path.rsplit('/', 1)[-1]); data = self.data()
             if set(data) == {'published'}:
@@ -504,7 +559,7 @@ def main():
     reset.add_argument('--login', required=True)
     serve = sub.add_parser('serve', help='Run the web server')
     serve.add_argument('--host', default='127.0.0.1')
-    serve.add_argument('--port', type=int, default=4173)
+    serve.add_argument('--port', type=int, default=int(os.environ.get('PORT', '4173')))
     args = parser.parse_args()
     init_db()
     if args.command == 'create-admin':
