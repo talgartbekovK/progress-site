@@ -1,6 +1,7 @@
 (() => {
   'use strict';
   const root = document.getElementById('app');
+  const demo = window.ProgressDemoApi || null;
   const state = { user: null, overview: null, students: [], section: 'overview', attendance: new Map(), edit: null };
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[ch]);
   const list = value => Array.isArray(value) ? value : [];
@@ -9,6 +10,7 @@
   const localDate = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
   const status = (message, kind = '') => { const el = document.getElementById('status'); if (el) { el.textContent = message; el.className = `status ${kind}`; } };
   async function api(path, options = {}) {
+    if (demo) return demo.request(path, options);
     const response = await fetch(`/api${path}`, { credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, ...options });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || data.message || (response.status === 401 ? 'Войдите в кабинет.' : `Ошибка сервера (${response.status}).`));
@@ -25,8 +27,9 @@
   function shell() {
     const admin = state.user.role === 'admin';
     const sections = admin ? [['overview','Обзор'],['registrations','Регистрации'],['applications','Заявки'],['students','Ученики'],['teachers','Преподаватели'],['tests','Тесты'],['videos','Видеоуроки']] : [['students','Мои ученики']];
-    root.innerHTML = `<div class="layout"><aside class="sidebar"><div class="brand"><span class="brand-mark">П</span><span>Прогресс</span></div><nav class="side-nav" aria-label="Разделы">${sections.map(([key, label]) => button(label, key, '', state.section === key)).join('')}</nav><div class="side-foot"><span>${esc(state.user.name)} · ${admin ? 'Администратор' : 'Преподаватель'}</span><button id="logout" type="button">Выйти</button></div></aside><main class="main"><header class="top"><div><h1 id="page-title"></h1><p>${admin ? 'Управление учебным центром' : 'Посещаемость и комментарии'}</p></div><a href="./index.html">На сайт ↗</a></header><p id="status" class="status" role="status" aria-live="polite"></p><div id="content"></div></main></div>`;
-    root.querySelector('#logout').addEventListener('click', async () => { try { await post('/logout', {}); state.user = null; state.overview = null; state.students = []; login(); } catch (error) { status(error.message, 'error'); } });
+    root.innerHTML = `<div class="layout"><aside class="sidebar"><div class="brand"><span class="brand-mark">П</span><span>Прогресс</span></div><nav class="side-nav" aria-label="Разделы">${sections.map(([key, label]) => button(label, key, '', state.section === key)).join('')}</nav><div class="side-foot"><span>${esc(state.user.name)} · ${admin ? 'Администратор' : 'Преподаватель'}</span>${demo ? `<button id="switch-role" type="button">${admin ? 'Кабинет преподавателя' : 'Кабинет администратора'}</button>` : ''}<button id="logout" type="button">${demo ? 'Сбросить демо' : 'Выйти'}</button></div></aside><main class="main"><header class="top"><div><h1 id="page-title"></h1><p>${admin ? 'Управление учебным центром' : 'Посещаемость и комментарии'}</p></div><a href="./index.html">На сайт ↗</a></header>${demo ? '<div class="demo-banner"><strong>Демонстрация админки</strong><span>Все имена и записи — примеры. Изменения действуют только до обновления страницы.</span></div>' : ''}<p id="status" class="status" role="status" aria-live="polite"></p><div id="content"></div></main></div>`;
+    root.querySelector('#logout').addEventListener('click', async () => { if (demo) { location.reload(); return; } try { await post('/logout', {}); state.user = null; state.overview = null; state.students = []; login(); } catch (error) { status(error.message, 'error'); } });
+    root.querySelector('#switch-role')?.addEventListener('click', async () => { state.user = demo.switchRole(); state.section = state.user.role === 'admin' ? 'overview' : 'students'; state.edit = null; await refresh(); shell(); });
     root.querySelectorAll('[data-nav]').forEach(el => el.addEventListener('click', () => { state.section = el.dataset.nav; state.edit = null; render(); }));
     render();
   }
